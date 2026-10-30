@@ -1,0 +1,12 @@
+# output-data/ (made by Implementation.Rmd) is committed on purpose, so that the app runs
+# right after cloning, without the 12-minute build.
+
+# Documents made by knitting the .Rmd files
+*.html
+*_files/
+
+# R and macOS session files
+.Rproj.user/
+.Rhistory
+.RData
+.DS_Store

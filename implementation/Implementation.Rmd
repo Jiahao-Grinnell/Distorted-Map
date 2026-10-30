@@ -1,0 +1,233 @@
+---
+title: "Implementation: World Map Distorted by Fertility Rate"
+author: "Nicky Moreno Gonzalez"
+date: "2026-10-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(readr)
+library(sf)
+library(rnaturalearth)
+library(cartogram)
+library(parallel)
+```
+
+## Data loading and cleaning
+
+Please run this file first (before the UI_run.Rmd file). It reads the raw UN fertility
+CSV from the `data` folder, joins it to a world map, builds the distorted maps (cartograms)
+and saves everything the app needs into the `output-data` folder.
+
+The folders are laid out like this (`World-Map-Fertility-Rate` is the main folder):
+
+```
+World-Map-Fertility-Rate/
+├── data/                 Raw UN CSV (never changed)
+├── implementation/       This file
+├── UI_run/               The Shiny app
+└── output-data/          Cleaned data written by this file, read by the app
+```
+
+```{r paths}
+# RStudio runs an .Rmd from the folder it is in, so the paths go up from implementation/
+data_dir   <- "../data"
+output_dir <- "../output-data"
+dir.create(output_dir, showWarnings = FALSE)
+
+raw_file <- list.files(data_dir, pattern = "^unpopulation_dataportal.*\\.csv$", full.names = TRUE)[1]
+if (is.na(raw_file)) stop("The UN CSV was not found in ", normalizePath(data_dir, mustWork = FALSE))
+```
+
+```{r load}
+# readr reads the file as UTF-8, so names such as "Cote d'Ivoire" and "Curacao" load correctly
+raw <- read_csv(raw_file, show_col_types = FALSE)
+
+tfr <- raw %>%
+  filter(!is.na(Iso3), Iso3 != "") %>%
+  transmute(
+    Iso3 = recode(Iso3, NRO = "NRU"),   # the UN file writes Nauru as NRO
+    Country = Location,
+    Year    = as.integer(Time),
+    TFR     = Value,
+    EstimateMethod
+  ) %>%
+  filter(!is.na(TFR)) %>%
+  arrange(Country, Year)
+
+years <- sort(unique(tfr$Year))
+cat("Countries:", n_distinct(tfr$Iso3), "| Years:", min(years), "to", max(years), "\n")
+```
+
+## World map
+
+```{r world}
+# Natural Earth country shapes. iso_a3_eh fixes France and Norway, which have -99 in iso_a3.
+world <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  filter(admin != "Antarctica") %>%
+  transmute(Iso3 = ifelse(adm0_a3 == "KOS", "XKX", iso_a3_eh),   # the UN file uses XKX for Kosovo
+            MapName = name_long, geometry) %>%
+  filter(Iso3 != "-99") %>%
+  st_make_valid()
+
+# Cut the shapes that cross the date line (Russia, Fiji, ...). Without this they are
+# drawn as one long strip across the whole map.
+world <- suppressWarnings(
+  st_wrap_dateline(world, options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180"), quiet = TRUE)
+)
+
+# Land area (km^2) on the sphere, before projecting. Used to size the distorted countries.
+world$Area_km2 <- as.numeric(st_area(world)) / 1e6
+
+# Robinson projection (flat world map that cartograms need)
+world <- world %>% st_make_valid() %>% st_transform("+proj=robin")
+
+# A country can be made of several polygons: keep one row per country
+world <- world %>%
+  group_by(Iso3, MapName) %>%
+  summarise(Area_km2 = sum(Area_km2), .groups = "drop")
+
+# Simplify the borders (tolerance in metres). Fewer points make the cartograms much faster.
+world <- st_simplify(world, preserveTopology = TRUE, dTolerance = 25000)
+
+# A few countries have islands on both sides of the date line (Fiji, Kiribati, New Zealand, Russia,
+# the USA). On a flat map those islands are at opposite edges, and a cartogram cannot place the
+# country. Keep the pieces on the same side as the biggest piece of the country. This only drops
+# a few far-away islands (for example the Chatham Islands and the tip of Chukotka).
+drop_far_parts <- function(x, max_distance = 2e7) {
+  crs <- st_crs(x)
+  g <- lapply(st_geometry(x), function(z) {
+    if (!inherits(z, "MULTIPOLYGON")) return(z)
+    parts <- unclass(z)
+    # Pieces that were not cut at the date line stretch across the whole map. Remove them first.
+    width <- vapply(parts, function(p) diff(range(p[[1]][, 1])), numeric(1))
+    parts <- parts[width < 2.5e7]
+    if (length(parts) == 0) return(st_multipolygon())
+    mid   <- vapply(parts, function(p) mean(range(p[[1]][, 1])), numeric(1))
+    size  <- vapply(parts, function(p) as.numeric(st_area(st_polygon(p))), numeric(1))
+    keep  <- parts[abs(mid - mid[which.max(size)]) < max_distance]
+    st_multipolygon(keep)
+  })
+  st_geometry(x) <- st_sfc(g, crs = crs)
+  x
+}
+world <- drop_far_parts(world)
+
+cat("Map countries:", nrow(world), "\n")
+cat("In the UN data but not on the map:\n")
+print(unique(tfr$Country[!tfr$Iso3 %in% world$Iso3]))
+cat("On the map but not in the UN data (shown as 'No data'):\n")
+print(world$MapName[!world$Iso3 %in% tfr$Iso3])
+```
+
+## Cartograms
+
+Each country is resized so that its area is proportional to
+**land area x total fertility rate**. Countries with high fertility swell and
+countries with low fertility shrink. Using the fertility rate alone would make a tiny
+country as large as a huge one. Countries missing from the UN data are sized with that
+year's median fertility rate and are marked as "No data".
+
+```{r cartogram-function}
+# Some shapes come out of the cartogram as polygon collections. Make every shape a MULTIPOLYGON,
+# so the app can draw all of them in the same way.
+to_multipolygon <- function(x) {
+  crs <- st_crs(x)
+  g <- lapply(st_geometry(x), function(z) {
+    if (inherits(z, "GEOMETRYCOLLECTION")) {
+      p <- st_collection_extract(st_sfc(z, crs = crs), "POLYGON")
+      if (length(p) == 0) return(st_multipolygon())
+      z <- st_union(p)[[1]]
+    }
+    if (inherits(z, "POLYGON")) z <- st_multipolygon(list(unclass(z)))
+    z
+  })
+  st_geometry(x) <- st_sfc(g, crs = crs)
+  x
+}
+
+# The contiguous cartogram can leave a thin strip as wide as the whole map (Fiji).
+# Remove the parts of a shape that are wider than 25,000 km.
+drop_wide_parts <- function(x, max_width = 2.5e7) {
+  crs <- st_crs(x)
+  g <- lapply(st_geometry(x), function(z) {
+    keep <- Filter(function(p) diff(range(p[[1]][, 1])) < max_width, unclass(z))
+    if (length(keep) == 0) st_multipolygon() else st_multipolygon(keep)
+  })
+  st_geometry(x) <- st_sfc(g, crs = crs)
+  x
+}
+
+make_year <- function(yr, type) {
+  y <- tfr %>% filter(Year == yr) %>% select(Iso3, Country, TFR, EstimateMethod)
+
+  d <- world %>%
+    left_join(y, by = "Iso3") %>%
+    mutate(
+      Country  = coalesce(Country, MapName),
+      NoData   = is.na(TFR),
+      Weight   = Area_km2 * coalesce(TFR, median(TFR, na.rm = TRUE)),
+      Year     = yr
+    )
+
+  out <- switch(type,
+    "Contiguous"     = cartogram_cont(d, "Weight", itermax = 8, verbose = FALSE),
+    "Non-contiguous" = cartogram_ncont(d, "Weight"),
+    "Dorling circles" = cartogram_dorling(d, "Weight", k = 0.7)
+  )
+
+  out <- st_make_valid(out)
+  # Simplify to keep the saved file small and the map fast to draw (tolerance in metres)
+  out <- st_simplify(out, preserveTopology = TRUE, dTolerance = 15000)
+  out <- drop_wide_parts(to_multipolygon(out))
+  out$Type <- type
+  out %>% select(Iso3, Country, Year, Type, TFR, EstimateMethod, NoData, geometry)
+}
+```
+
+The contiguous cartogram is slow (about 25 seconds per year), so every year and every
+type is computed once here, in parallel (roughly 5 to 10 minutes), and the app only reads the result.
+Set `rebuild <- FALSE` to reuse a file that already exists.
+
+```{r cartogram-run}
+rebuild <- TRUE
+carto_file <- file.path(output_dir, "cartograms.rds")
+
+if (rebuild || !file.exists(carto_file)) {
+  types <- c("Contiguous", "Non-contiguous", "Dorling circles")
+  jobs  <- expand.grid(year = years, type = types, stringsAsFactors = FALSE)
+
+  cores <- max(1, min(detectCores() - 1, 6))
+  t0 <- Sys.time()
+  pieces <- mclapply(seq_len(nrow(jobs)), function(i) {
+    tryCatch(make_year(jobs$year[i], jobs$type[i]),
+             error = function(e) { message("Failed: ", jobs$year[i], " ", jobs$type[i], ": ", conditionMessage(e)); NULL })
+  }, mc.cores = cores)
+
+  failed <- sum(vapply(pieces, is.null, logical(1)))
+  if (failed > 0) warning(failed, " cartograms failed. See the messages above.")
+
+  cartograms <- do.call(rbind, pieces[!vapply(pieces, is.null, logical(1))])
+  saveRDS(cartograms, carto_file)
+  cat("Built", nrow(jobs) - failed, "cartograms in", round(difftime(Sys.time(), t0, units = "mins"), 1), "minutes\n")
+}
+```
+
+## Saving the cleaned data
+
+```{r save}
+# Country-by-year table for the app (line chart, country details)
+write_csv(tfr, file.path(output_dir, "tfr_clean.csv"))
+
+# Rows that were missing a value after the cartograms were built, for checking
+cartograms <- readRDS(carto_file)
+cartograms %>%
+  st_drop_geometry() %>%
+  group_by(Type) %>%
+  summarise(Years = n_distinct(Year), Rows = n(), NoData = sum(NoData), .groups = "drop") %>%
+  print()
+
+list.files(output_dir)
+```

@@ -1,0 +1,314 @@
+---
+title: "World Map Distorted by Fertility Rate"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(shiny)
+library(dplyr)
+library(readr)
+library(sf)
+library(plotly)
+```
+
+## Loading Cleaned Data
+
+Please run the Implementation.Rmd file (in the `implementation` folder) before this file.
+It creates the cleaned data that this file reads from the `output-data` folder, which is
+one level up from this `UI_run` folder.
+
+```{r load}
+# The cleaned files are in output-data, one folder up from this file.
+# (If R is running from the main project folder instead, look for output-data there.)
+output_dir <- "../output-data"
+if (!dir.exists(output_dir)) output_dir <- "output-data"
+
+needed <- c("cartograms.rds", "tfr_clean.csv")
+if (!all(file.exists(file.path(output_dir, needed)))) {
+  stop("The cleaned files are missing from ", output_dir,
+       ". Run Implementation.Rmd first; it creates them.")
+}
+
+cartograms <- readRDS(file.path(output_dir, "cartograms.rds"))
+tfr        <- read_csv(file.path(output_dir, "tfr_clean.csv"), show_col_types = FALSE)
+
+years       <- sort(unique(tfr$Year))
+countries   <- sort(unique(tfr$Country))
+map_types   <- c("Contiguous", "Non-contiguous", "Dorling circles")
+
+# The same map window for every year and every type, so the map does not jump when the year or
+# the type changes. It is the size of the contiguous map plus a small margin. (A few shapes of the
+# non-contiguous map are bigger than the window in some years, and are cut at its edge.)
+b <- st_bbox(cartograms[cartograms$Type == "Contiguous", ])
+pad_x <- 0.03 * (b[["xmax"]] - b[["xmin"]])
+pad_y <- 0.03 * (b[["ymax"]] - b[["ymin"]])
+map_window <- lapply(setNames(map_types, map_types), function(t) {
+  list(x = c(b[["xmin"]] - pad_x, b[["xmax"]] + pad_x), y = c(b[["ymin"]] - pad_y, b[["ymax"]] + pad_y))
+})
+
+# One table per type and year, so that showing a map is a simple lookup and not a search of all rows
+carto_list <- split(cartograms, paste(cartograms$Type, cartograms$Year, sep = "|"))
+rm(cartograms)
+```
+
+```{r classes}
+# Fixed classes are used for every year, so that colors mean the same thing in 1950 and in 2026.
+class_breaks <- c(0, 1.5, 2.1, 3, 4.5, 6, Inf)
+class_labels <- c("Below 1.5", "1.5 to 2.1 (below replacement)", "2.1 to 3.0",
+                  "3.0 to 4.5", "4.5 to 6.0", "6.0 and above")
+no_data_label <- "No data"
+
+class_colors <- c("#e5f5e0", "#c7e9c0", "#74c476", "#31a354", "#006d2c", "#00441b")
+names(class_colors) <- class_labels
+class_colors <- c(class_colors, setNames("#fff7a8", no_data_label))
+
+tfr_class <- function(x) {
+  out <- as.character(cut(x, breaks = class_breaks, labels = class_labels, right = FALSE))
+  out[is.na(x)] <- no_data_label
+  out
+}
+```
+
+```{r ui}
+ui <- fluidPage(
+  navbarPage("World Map Distorted by Fertility Rate", selected = "Map",
+    tabPanel("About",
+      fluidRow(column(8, offset = 2,
+        h3("About this map"),
+        p("This map shows the world, distorted by fertility rate: each country is resized so that its
+           area is proportional to its land area multiplied by its total fertility rate. Countries with
+           high fertility look bigger and countries with low fertility look smaller."),
+        tags$ul(
+          tags$li("Use the year slider to see how the world changes between 1950 and 2026."),
+          tags$li("Choose the type of distortion: contiguous (countries stay connected), non-contiguous
+                   (countries keep their shape and resize in place) or Dorling circles."),
+          tags$li("The map changes only when you press Update map, because drawing a map takes a moment.
+                   You can change the year and the type as many times as you like before pressing it."),
+          tags$li("Click on a country, or choose it in the Country menu, to see its fertility rate and its
+                   history."),
+          tags$li("Countries in yellow have no data in this data set. They are drawn with the median
+                   fertility rate of that year so that the map stays connected."),
+          tags$li("Values the UN file labels as \"Projection\" (all values from 2024 on, and some earlier
+                   ones) are marked as such.")
+        ),
+        h4("Source"),
+        p("United Nations, Department of Economic and Social Affairs, Population Division.
+           World Population Prospects 2024: Total fertility rate (both sexes, median variant),
+           downloaded from the UN Data Portal."),
+        p("The classes are the same in every year. The replacement level, about 2.1 births per woman,
+           is the limit between the second and the third class.")
+      ))
+    ),
+    tabPanel("Map",
+      sidebarLayout(position = "left",
+        sidebarPanel(width = 3,
+          # The map is only redrawn when the button is pressed, and the button is switched off
+          # while a map is being drawn, so that clicks cannot pile up.
+          tags$style("html.shiny-busy #update_map { pointer-events: none; opacity: 0.5; }"),
+          sliderInput("year", "Year", min = min(years), max = max(years),
+                      value = 2023, step = 1, sep = ""),
+          radioButtons("map_type", "Type of distortion", choices = map_types,
+                       selected = "Contiguous"),
+          actionButton("update_map", "Update map", class = "btn-primary", width = "100%"),
+          uiOutput("map_status"),
+          tags$hr(),
+          selectInput("country", "Country (or click it on the map)",
+                      choices = c("None" = "", countries), selected = ""),
+          tags$hr(),
+          tags$b("Total fertility rate"),
+          tags$div(style = "font-size: 12px; color: #555;", "(births per woman)"),
+          uiOutput("legend")
+        ),
+        mainPanel(width = 9,
+          plotlyOutput("map", height = "520px"),
+          tags$hr(),
+          fluidRow(
+            column(4, uiOutput("country_info")),
+            column(8, plotlyOutput("country_plot", height = "260px"))
+          )
+        )
+      )
+    )
+
+  )
+)
+```
+
+```{r server}
+server <- function(input, output, session) {
+
+  # The year and type that are on the map now. They only change when Update map is pressed
+  # (and once when the app opens). Nothing else redraws the map.
+  applied <- eventReactive(input$update_map, {
+    list(year = input$year, type = input$map_type)
+  }, ignoreNULL = FALSE)
+
+  output$map_status <- renderUI({
+    a <- applied()
+    changed <- input$year != a$year || input$map_type != a$type
+    tags$div(style = "font-size: 12px; margin-top: 6px;",
+      tags$div(style = "color: #555;", paste0("Showing: ", a$year, ", ", tolower(a$type))),
+      if (changed) tags$div(style = "color: #b45f06;", "Settings changed. Press Update map."))
+  })
+
+  # Map data for the year and type that are on the map
+  map_data <- reactive({
+    a <- applied()
+    d <- carto_list[[paste(a$type, a$year, sep = "|")]]
+    d$Class <- factor(tfr_class(d$TFR), levels = names(class_colors))
+    d$Hover <- ifelse(
+      d$NoData,
+      paste0("<b>", d$Country, "</b><br>No data"),
+      paste0("<b>", d$Country, "</b><br>Fertility rate: ", sprintf("%.2f", d$TFR),
+             "<br>", d$Class,
+             ifelse(d$EstimateMethod == "Projection", "<br><i>UN projection</i>", ""))
+    )
+    d
+  })
+
+  # The black outline of the chosen country, as a line trace (the shape's coordinates, with a gap
+  # between rings). It is added to, or removed from, the map that is already drawn.
+  outline_trace <- function(d, country) {
+    if (!nzchar(country)) return(NULL)
+    sel <- d[d$Country == country, ]
+    if (nrow(sel) == 0 || all(st_is_empty(sel))) return(NULL)
+    m   <- st_coordinates(st_geometry(sel)[[1]])
+    grp <- do.call(paste, as.data.frame(m[, setdiff(colnames(m), c("X", "Y")), drop = FALSE]))
+    pieces <- split(as.data.frame(m[, c("X", "Y")]), factor(grp, unique(grp)))
+    list(x = unlist(lapply(pieces, function(p) c(p$X, NA)), use.names = FALSE),
+         y = unlist(lapply(pieces, function(p) c(p$Y, NA)), use.names = FALSE),
+         type = "scatter", mode = "lines", hoverinfo = "skip", showlegend = FALSE,
+         line = list(color = "black", width = 2.5))
+  }
+
+  state <- new.env()      # n_base: number of country traces; overlay: is an outline on the map?
+  state$n_base  <- 0
+  state$overlay <- FALSE
+
+  output$map <- renderPlotly({
+    d   <- map_data()
+    win <- map_window[[applied()$type]]
+
+    p <- plot_ly(source = "map") %>%
+      add_sf(data = d, split = ~Country, color = ~Class, colors = class_colors,
+             stroke = I("#6b7b6e"), span = I(0.5),
+             text = ~Hover, hoverinfo = "text", hoveron = "fills",
+             showlegend = FALSE) %>%
+      layout(
+        xaxis = list(visible = FALSE, range = win$x, fixedrange = FALSE),
+        yaxis = list(visible = FALSE, range = win$y, scaleanchor = "x"),
+        margin = list(l = 0, r = 0, t = 0, b = 0),
+        dragmode = "pan"
+      ) %>%
+      config(displayModeBar = TRUE, scrollZoom = TRUE, displaylogo = FALSE,
+             modeBarButtonsToRemove = c("select2d", "lasso2d", "toImage"))
+
+    # Remember which country each trace is, so that a click can be matched to a country.
+    # (A trace is named "country<br />class".) This is done before the outline is added.
+    built <- plotly_build(p)
+    trace_country <<- vapply(built$x$data, function(tr) {
+      parts <- strsplit(if (is.null(tr$name)) "" else tr$name, "<br />", fixed = TRUE)[[1]]
+      hit <- parts[parts %in% countries]
+      if (length(hit) > 0) hit[1] else NA_character_
+    }, character(1))
+    state$n_base  <- length(built$x$data)
+    state$overlay <- FALSE
+
+    # Outline the chosen country. isolate(): choosing another country must not redraw the map.
+    tr <- outline_trace(d, isolate(input$country))
+    if (!is.null(tr)) {
+      p <- do.call(add_trace, c(list(p), tr))
+      state$overlay <- TRUE
+    }
+    event_register(p, "plotly_click")
+  })
+
+  # Choosing or clicking a country only moves the outline on the map that is already drawn
+  observeEvent(input$country, ignoreInit = TRUE, {
+    proxy <- plotlyProxy("map", session)
+    if (state$overlay) plotlyProxyInvoke(proxy, "deleteTraces", list(as.integer(state$n_base)))
+    state$overlay <- FALSE
+    tr <- outline_trace(map_data(), input$country)
+    if (!is.null(tr)) {
+      plotlyProxyInvoke(proxy, "addTraces", tr)
+      state$overlay <- TRUE
+    }
+  })
+
+  # Clicking a country on the map selects it (curveNumber starts at 0)
+  trace_country <- character(0)
+  observeEvent(event_data("plotly_click", source = "map"), {
+    ev <- event_data("plotly_click", source = "map")
+    clicked <- trace_country[ev$curveNumber + 1]
+    if (length(clicked) == 1 && !is.na(clicked) && clicked %in% countries) {
+      updateSelectInput(session, "country", selected = clicked)
+    }
+  })
+
+  # Legend
+  output$legend <- renderUI({
+    tags$div(lapply(rev(names(class_colors)), function(lbl) {
+      tags$div(style = "display: flex; align-items: center; margin: 3px 0; font-size: 13px;",
+        tags$span(style = paste0("display: inline-block; width: 22px; height: 14px; margin-right: 8px; ",
+                                 "border: 1px solid #999; background: ", class_colors[[lbl]], ";")),
+        lbl)
+    }))
+  })
+
+  # Country details
+  country_row <- reactive({
+    req(nzchar(input$country))
+    tfr %>% filter(Country == input$country, Year == applied()$year)
+  })
+
+  output$country_info <- renderUI({
+    if (!nzchar(input$country)) {
+      return(tags$p(style = "color: #666;", "Click on a country on the map, or choose one in the Country menu."))
+    }
+    r <- country_row()
+    shown_year <- applied()$year       # the year on the map, not the slider
+    if (nrow(r) == 0) {
+      return(tagList(h4(input$country), p("No data for this country in ", shown_year, ".")))
+    }
+    year_all <- tfr %>% filter(Year == shown_year)
+    rank_n   <- sum(year_all$TFR > r$TFR) + 1
+    tagList(
+      h4(input$country),
+      tags$p(tags$b("Year: "), shown_year),
+      tags$p(tags$b("Total fertility rate: "), sprintf("%.2f", r$TFR), " births per woman"),
+      tags$p(tags$b("Class: "), tfr_class(r$TFR)),
+      tags$p(tags$b("Rank: "), rank_n, " of ", nrow(year_all), " countries (1 = highest)"),
+      tags$p(tags$b("Type of value: "), r$EstimateMethod)
+    )
+  })
+
+  output$country_plot <- renderPlotly({
+    req(nzchar(input$country))
+    h <- tfr %>% filter(Country == input$country)
+    req(nrow(h) > 0)
+    plot_ly(h, x = ~Year, y = ~TFR, type = "scatter", mode = "lines",
+            line = list(color = "#31a354", width = 3),
+            hovertemplate = "%{x}: %{y:.2f}<extra></extra>") %>%
+      layout(
+        title = list(text = paste("Fertility rate in", input$country), font = list(size = 14)),
+        xaxis = list(title = ""),
+        yaxis = list(title = "Births per woman", rangemode = "tozero"),
+        shapes = list(
+          list(type = "line", x0 = min(years), x1 = max(years), y0 = 2.1, y1 = 2.1,
+               line = list(color = "grey", dash = "dot", width = 1)),
+          list(type = "line", x0 = applied()$year, x1 = applied()$year, y0 = 0, y1 = 1, yref = "paper",
+               line = list(color = "black", width = 1))
+        ),
+        annotations = list(list(x = max(years), y = 2.1, text = "Replacement level (2.1)",
+                                showarrow = FALSE, xanchor = "right", yanchor = "bottom",
+                                font = list(size = 10, color = "grey"))),
+        margin = list(t = 40)
+      ) %>%
+      config(displayModeBar = FALSE)
+  })
+}
+
+shinyApp(ui = ui, server = server, options = list(height = 1050))
+```
